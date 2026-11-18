@@ -33,6 +33,9 @@ func Open(dir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkReplaceIntent(absolute); err != nil {
+		return nil, err
+	}
 	image, err := snapshot.Read(filepath.Join(absolute, "checkpoint.lmi"))
 	missing := os.IsNotExist(err)
 	if err != nil && !missing {

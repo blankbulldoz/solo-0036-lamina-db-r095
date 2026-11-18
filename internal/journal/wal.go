@@ -13,6 +13,89 @@ import (
 
 const MaxFrame = 16 << 20
 
+const headerSize = 16
+
+func headerBytes(base uint64) []byte {
+	header := make([]byte, headerSize)
+	copy(header[:4], "LMW1")
+	binary.BigEndian.PutUint64(header[4:12], base)
+	binary.BigEndian.PutUint32(header[12:], crc32.ChecksumIEEE(header[:12]))
+	return header
+}
+
+// Info describes the on-disk journal header without opening the directory
+// for replay and without taking the exclusive lock.
+type Info struct {
+	Exists bool
+	Valid  bool
+	Empty  bool
+	Base   uint64
+}
+
+// Inspect reads only the journal header; it never mutates the file.
+func Inspect(dir string) (Info, error) {
+	var info Info
+	f, err := os.Open(filepath.Join(dir, "journal.lmw"))
+	if os.IsNotExist(err) {
+		return info, nil
+	}
+	if err != nil {
+		return info, err
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		return info, err
+	}
+	info.Exists = true
+	var header [headerSize]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		return info, nil
+	}
+	if string(header[:4]) != "LMW1" || crc32.ChecksumIEEE(header[:12]) != binary.BigEndian.Uint32(header[12:]) {
+		return info, nil
+	}
+	info.Valid = true
+	info.Base = binary.BigEndian.Uint64(header[4:12])
+	info.Empty = stat.Size() == headerSize
+	return info, nil
+}
+
+// Create atomically installs a fresh journal carrying only a header with the
+// given base. The caller must hold the directory exclusively.
+func Create(dir string, base uint64) error {
+	f, err := os.CreateTemp(dir, ".lamina-journal-")
+	if err != nil {
+		return err
+	}
+	temp := f.Name()
+	defer os.Remove(temp)
+	if err = f.Chmod(0600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err = f.Write(headerBytes(base)); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(temp, filepath.Join(dir, "journal.lmw")); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 type WAL struct {
 	Base          uint64
 	file          *os.File
@@ -46,11 +129,7 @@ func Open(dir string, base uint64) (*WAL, error) {
 		return nil, err
 	}
 	if info.Size() == 0 {
-		header := make([]byte, 16)
-		copy(header[:4], "LMW1")
-		binary.BigEndian.PutUint64(header[4:12], base)
-		binary.BigEndian.PutUint32(header[12:], crc32.ChecksumIEEE(header[:12]))
-		if _, err = f.Write(header); err == nil {
+		if _, err = f.Write(headerBytes(base)); err == nil {
 			err = f.Sync()
 		}
 		if err != nil {

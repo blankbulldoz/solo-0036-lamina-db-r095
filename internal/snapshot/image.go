@@ -36,37 +36,50 @@ func Encode(image Image) ([]byte, error) {
 	return json.Marshal(Envelope{Format: 1, Digest: hex.EncodeToString(h[:]), Payload: b})
 }
 func Decode(b []byte) (Image, error) {
+	image, _, err := DecodeDigest(b)
+	return image, err
+}
+
+// DecodeDigest validates a portable image and also returns the payload
+// digest recorded in the envelope, which identifies the selected image.
+func DecodeDigest(b []byte) (Image, string, error) {
 	var image Image
 	var env Envelope
 	if len(b) > MaxImage {
-		return image, fmt.Errorf("image exceeds limit")
+		return image, "", fmt.Errorf("image exceeds limit")
 	}
 	if err := json.Unmarshal(b, &env); err != nil {
-		return image, err
+		return image, "", err
 	}
 	h := sha256.Sum256(env.Payload)
 	if env.Format != 1 || hex.EncodeToString(h[:]) != env.Digest {
-		return image, fmt.Errorf("image format or digest mismatch")
+		return image, "", fmt.Errorf("image format or digest mismatch")
 	}
 	if err := json.Unmarshal(env.Payload, &image); err != nil {
-		return image, err
+		return image, "", err
 	}
 	if err := Validate(image); err != nil {
-		return image, err
+		return image, "", err
 	}
-	return image, nil
+	return image, env.Digest, nil
 }
 func Read(path string) (Image, error) {
+	image, _, err := ReadDigest(path)
+	return image, err
+}
+
+// ReadDigest reads and validates an image file and returns its payload digest.
+func ReadDigest(path string) (Image, string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return Image{}, err
+		return Image{}, "", err
 	}
 	defer f.Close()
 	b, err := io.ReadAll(io.LimitReader(f, MaxImage+1))
 	if err != nil {
-		return Image{}, err
+		return Image{}, "", err
 	}
-	return Decode(b)
+	return DecodeDigest(b)
 }
 func Validate(image Image) error {
 	if image.Format != 1 || image.Horizon > image.Sequence || image.Catalog == nil || image.Store == nil || image.Catalog.Relations == nil || image.Catalog.Indexes == nil || image.Store.Tables == nil {

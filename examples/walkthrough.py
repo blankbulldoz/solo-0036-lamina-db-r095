@@ -3,14 +3,15 @@
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
 WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
 class Session:
- def __init__(self,binary,root,restore=None):
-  self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
+ def __init__(self,binary,root,restore=None,extra=None):
+  self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.extra=extra or [];self.process=None;self.log=None
  def start(self):
   with socket.socket() as sock:
    sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
   self.url=f'http://127.0.0.1:{port}/v1/lamina'
   args=[self.binary,'-data',str(self.root),'-listen',f'127.0.0.1:{port}']
   if self.restore:args+=['-restore',str(self.restore)];self.restore=None
+  args+=self.extra;self.extra=[]
   self.log=tempfile.TemporaryFile();self.process=subprocess.Popen(args,stdout=self.log,stderr=self.log)
   deadline=time.monotonic()+8
   while time.monotonic()<deadline:
@@ -129,7 +130,70 @@ def walkthrough(name,binary):
     other.call('GET','/changes?after=0',status=410)
     broken=json.loads(backup);broken['sha256']='0'*64;bad=temp/'bad.lmi';bad.write_text(json.dumps(broken))
     failed=subprocess.run([str(binary),'-restore',str(bad),'-data',str(temp/'badrestore')],capture_output=True,text=True,timeout=5)
-    require(failed.returncode!=0 and not (temp/'badrestore').exists(),'invalid backup published');observations={'restored_commit':result,'original_sequence':seed_seq}
+    require(failed.returncode!=0 and not (temp/'badrestore').exists(),'invalid backup published')
+    # explicit in-place replacement of an offline directory owned by this database
+    image=s.call('GET','/backup',raw=True);image_path=temp/'replace.lmi';image_path.write_bytes(image)
+    image_seq=s.stats()['sequence']
+    tx=s.begin();s.put(tx,tuple_(9));later=s.commit(tx)['sequence'];s.stop();root=s.root
+    def reject(args,env=None):
+     merged=dict(os.environ);merged.update(env or {})
+     return subprocess.run([str(binary),*args],capture_output=True,text=True,timeout=15,env=merged)
+    r=reject(['-restore',str(image_path),'-data',str(root)])
+    require(r.returncode!=0,'restore without -replace accepted an existing directory')
+    r=reject(['-restore',str(bad),'-replace','-data',str(root)])
+    require(r.returncode!=0,'corrupt backup replaced the old directory')
+    foreign=temp/'foreign';foreign.mkdir();(foreign/'notes.txt').write_text('keep me')
+    r=reject(['-restore',str(image_path),'-replace','-data',str(foreign)])
+    require(r.returncode!=0 and 'unrelated' in r.stderr,'directory with unrelated files accepted')
+    r=reject(['-restore',str(image_path),'-replace','-data',str(temp/'missing')])
+    require(r.returncode!=0,'missing directory accepted for replacement')
+    kept=Session(binary,root).start();require(kept.stats()['sequence']==later,'failed replacements damaged the old database');kept.stop()
+    # an interrupted fresh restore is recognized and resumed, never served
+    r=reject(['-restore',str(image_path),'-data',str(temp/'half')],{'LAMINA_INSTALL_BREAK':'intent'})
+    require(r.returncode!=0 and (temp/'half'/'restore.intent').exists(),'interrupted restore left no intent marker')
+    locked=subprocess.run([str(binary),'-data',str(temp/'half'),'-listen','127.0.0.1:0'],capture_output=True,text=True,timeout=5)
+    require(locked.returncode!=0 and 'unfinished' in locked.stderr,'interrupted restore served as a database')
+    half=Session(binary,temp/'half',restore=image_path).start()
+    require(half.stats()['sequence']==image_seq,'resumed restore did not reach the image sequence');half.stop()
+    # an interrupted replacement is recognized, never served, and rolls back
+    r=reject(['-restore',str(image_path),'-replace','-data',str(root)],{'LAMINA_INSTALL_BREAK':'staged'})
+    require(r.returncode!=0 and not (root/'restore.intent').exists(),'staged phase left an intent marker')
+    kept=Session(binary,root).start();require(kept.stats()['sequence']==later,'staged replacement touched the old database');kept.stop()
+    r=reject(['-restore',str(image_path),'-replace','-data',str(root)],{'LAMINA_INSTALL_BREAK':'quarantined'})
+    require(r.returncode!=0 and (root/'restore.intent').exists(),'interrupted replacement left no intent marker')
+    locked=subprocess.run([str(binary),'-data',str(root),'-listen','127.0.0.1:0'],capture_output=True,text=True,timeout=5)
+    require(locked.returncode!=0 and 'unfinished' in locked.stderr,'interrupted replacement served as a database')
+    r=reject(['-restore',str(path),'-replace','-data',str(root)])
+    require(r.returncode!=0 and 'different image' in r.stderr,'a different image mixed into an unfinished replacement')
+    rolled=Session(binary,root,extra=['-replace-abort']).start()
+    require(rolled.stats()['sequence']==later and rolled.query()['matched']==9,'rollback lost the old database')
+    rolled.stop();require(not (root/'restore.intent').exists(),'rollback left the intent marker')
+    # resuming rolls the same image forward; post-image commits never mix in
+    r=reject(['-restore',str(image_path),'-replace','-data',str(root)],{'LAMINA_INSTALL_BREAK':'installed'})
+    require(r.returncode!=0,'install breakpoint did not stop the process')
+    replaced=Session(binary,root,restore=image_path,extra=['-replace']).start()
+    require(replaced.stats()['sequence']==image_seq,'resumed replacement did not reach the image sequence')
+    require(replaced.query()['matched']==8,'post-backup commit mixed into the replaced database')
+    require(replaced.stats()['history_base']==image_seq,'replaced journal base is not the image sequence')
+    replaced.call('GET','/changes?after=0',status=410)
+    page=replaced.call('GET',f'/changes?after={image_seq}')
+    require(page['cursor']==image_seq and page['head']==image_seq and not page['records'],'replaced cursor range wrong')
+    replaced.call('POST','/query',{'relation':'spectra','at':later},status=410)
+    r=reject(['-restore',str(image_path),'-replace','-data',str(root)])
+    require(r.returncode!=0 and 'already open' in r.stderr,'replacement opened a held directory')
+    tx=replaced.begin();replaced.put(tx,tuple_(10));continued=replaced.commit(tx)
+    require(continued['sequence']==image_seq+1,'replaced journal did not continue from the image base')
+    replaced.stop();replaced.start()
+    require(replaced.query()['matched']==9 and replaced.stats()['sequence']==image_seq+1,'replaced database did not survive restart')
+    replaced.stop()
+    # replacing again with the same image is explicit and repeatable
+    again=Session(binary,root,restore=image_path,extra=['-replace']).start()
+    require(again.stats()['sequence']==image_seq and again.query()['matched']==8,'repeat replacement did not revert to the image')
+    again.stop()
+    noop=Session(binary,root,restore=image_path,extra=['-replace']).start()
+    require(noop.stats()['sequence']==image_seq,'idempotent replacement changed the installed image')
+    noop.stop()
+    observations={'restored_commit':result,'original_sequence':seed_seq,'replaced_sequence':image_seq,'continued':continued['sequence']}
    elif name=='changes':
     tx=s.begin()
     for n in range(8,12):s.put(tx,tuple_(n))

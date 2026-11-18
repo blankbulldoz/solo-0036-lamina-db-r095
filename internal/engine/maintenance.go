@@ -1,12 +1,10 @@
 package engine
 
 import (
-	"fmt"
 	"lamina/internal/index"
 	"lamina/internal/journal"
 	"lamina/internal/snapshot"
 	"lamina/internal/versions"
-	"os"
 	"path/filepath"
 )
 
@@ -38,37 +36,6 @@ func (d *DB) Backup() ([]byte, error) {
 		return nil, fault("capacity", "backup exceeds 128MiB")
 	}
 	return b, nil
-}
-func Restore(dir string, data []byte) error {
-	image, err := snapshot.Decode(data)
-	if err != nil {
-		return err
-	}
-	if err = os.Mkdir(dir, 0700); err != nil {
-		return fmt.Errorf("restore requires a new directory: %w", err)
-	}
-	installed := false
-	defer func() {
-		if !installed {
-			os.Remove(filepath.Join(dir, "checkpoint.lmi"))
-			os.Remove(filepath.Join(dir, "journal.lmw"))
-			os.Remove(filepath.Join(dir, "lamina.lock"))
-			os.Remove(dir)
-		}
-	}()
-	w, err := journal.Open(dir, image.Sequence)
-	if err != nil {
-		return err
-	}
-	if err = snapshot.Write(filepath.Join(dir, "checkpoint.lmi"), image); err != nil {
-		w.Close()
-		return err
-	}
-	if err = w.Close(); err != nil {
-		return err
-	}
-	installed = true
-	return nil
 }
 func (d *DB) Vacuum(requested uint64) (versions.VacuumResult, error) {
 	d.mu.Lock()

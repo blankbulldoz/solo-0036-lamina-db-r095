@@ -25,8 +25,20 @@ func run() error {
 	dir := flag.String("data", "var/lamina", "data directory exclusively owned by this process")
 	addr := flag.String("listen", "127.0.0.1:7386", "HTTP bind address")
 	restore := flag.String("restore", "", "validated backup to install into a new data directory before serving")
+	replace := flag.Bool("replace", false, "let -restore replace an existing offline lamina data directory, reverting it to the selected backup")
+	abort := flag.Bool("replace-abort", false, "roll an interrupted replacement in the data directory back to the old state before serving")
 	flag.Parse()
-	if *restore != "" {
+	if *abort && (*restore != "" || *replace) {
+		return fmt.Errorf("-replace-abort cannot be combined with -restore or -replace")
+	}
+	if *replace && *restore == "" {
+		return fmt.Errorf("-replace requires -restore")
+	}
+	if *abort {
+		if err := engine.AbortReplace(*dir); err != nil {
+			return err
+		}
+	} else if *restore != "" {
 		info, err := os.Stat(*restore)
 		if err != nil {
 			return err
@@ -38,7 +50,12 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		if err = engine.Restore(*dir, b); err != nil {
+		if *replace {
+			err = engine.RestoreReplace(*dir, b)
+		} else {
+			err = engine.Restore(*dir, b)
+		}
+		if err != nil {
 			return err
 		}
 	}
